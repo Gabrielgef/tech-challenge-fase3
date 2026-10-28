@@ -1,0 +1,8 @@
+"rede_key","codigo_rede_origem","nome_rede","escopo_publico","rotulo_confirmado","atualizado_em"
+"PRIVADA","4","Privada","false","true","2026-08-29 16:11:13.841000"
+"FEDERAL","1","Federal","true","true","2026-08-29 16:11:13.841000"
+"TOTAL","0","Total (todas as redes; confirmar rótulo na origem)","false","false","2026-08-29 16:11:13.841000"
+"PUBLICA_EST_MUN","5","Pública (Estadual e Municipal)","true","true","2026-08-29 16:11:13.841000"
+"PUBLICA","6","Pública (escopo completo; confirmar rótulo na origem)","true","false","2026-08-29 16:11:13.841000"
+"MUNICIPAL","3","Municipal","true","true","2026-08-29 16:11:13.841000"
+"ESTADUAL","2","Estadual","true","true","2026-08-29 16:11:13.841000"
