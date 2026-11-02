@@ -1,0 +1,19 @@
+{
+  "modelo": "Random forest",
+  "parametros": {
+    "n_estimators": 300,
+    "min_samples_leaf": 5,
+    "max_features": 1.0,
+    "max_depth": 8
+  },
+  "auc_validacao_cruzada": 0.7078,
+  "teste": {
+    "auc": 0.7081,
+    "ap": 0.7541,
+    "f1": 0.7407,
+    "precisao_nao_cumpre": 0.6644,
+    "recall_nao_cumpre": 0.4794,
+    "acuracia": 0.6729
+  },
+  "semente": 42
+}
