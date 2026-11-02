@@ -1,279 +1,204 @@
 """
-Módulo de construção da Analytical Base Table (ABT) para a Fase 3.
-Consome as 6 tabelas da camada Gold (3 Fatos + 3 Dimensões da Fase 2),
-previne Data Leakage via lag temporal (2023 -> 2024) e enriquece a base
-com indicadores socioeconómicos e demográficos da API do IBGE (PIB e população estimada).
+Construção da Analytical Base Table (ABT) da Fase 3.
+
+Cada linha é um município (rede municipal, 2º ano do EF). As features vêm de
+2023 e o target (atingiu a meta de 2024?) vem de 2024, então nada do ano-alvo
+entra como preditor. As colunas de 2024 ficam na base só para auditoria e
+para a EDA; a lista COLUNAS_ANO_ALVO existe para a etapa de modelagem
+descartá-las de forma explícita.
+
+Decisões que vieram da exploração dos dados (ver notebooks/01_eda_hipoteses):
+  * só a rede MUNICIPAL tem meta em ftc_meta_alfabetizacao; as demais redes
+    herdariam a meta municipal por engano se o join fosse só por município;
+  * a distribuição por níveis (nivel_0..8) não existe em 2023, então nenhum
+    indicador de nível entra como feature;
+  * na fct_cobertura_avaliacao, presentes, cadernos válidos e taxa de presença
+    estão zerados, e os 621 municípios de SP não aparecem na tabela;
+  * o PIB da SIDRA (tabela 5938, variável 37) é total em mil R$, e o PIB per
+    capita é calculado aqui dividindo pela população.
+
+Uso (a partir da raiz do projeto):
+    python src/preprocessing/build_dataset.py
 """
 
 from pathlib import Path
-import warnings
-import requests
+
 import numpy as np
 import pandas as pd
+import requests
 
-warnings.filterwarnings("ignore")
-
-# Caminhos base do projeto (padrão CCDS)
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_DIR / "data"
 EXTERNAL_DIR = DATA_DIR / "external"
 PROCESSED_DIR = DATA_DIR / "processed"
 
+ANO_FEATURES = 2023
+ANO_TARGET = 2024
+REDE_ALVO = "MUNICIPAL"
 
-def localiza_csv(nome_arquivo: str) -> Path:
-    """Procura recursivamente o ficheiro CSV dentro da pasta data/."""
-    matches = list(DATA_DIR.rglob(nome_arquivo))
-    if not matches:
+SIDRA_PIB = "https://apisidra.ibge.gov.br/values/t/5938/n6/all/v/37/p/last%201?formato=json"
+SIDRA_POP = "https://apisidra.ibge.gov.br/values/t/6579/n6/all/v/9324/p/last%201?formato=json"
+
+# Colunas que só existem depois do ano-alvo: nunca podem ser features.
+COLUNAS_ANO_ALVO = [
+    "taxa_alfabetizacao_2024_pct",
+    "media_portugues_2024",
+    "participacao_2024_pct",
+    "target_atingiu_meta_2024",
+]
+
+MACRORREGIAO = {"1": "Norte", "2": "Nordeste", "3": "Sudeste", "4": "Sul", "5": "Centro-Oeste"}
+
+
+def localiza_csv(nome: str) -> Path:
+    achados = list(DATA_DIR.rglob(nome))
+    if not achados:
         raise FileNotFoundError(
-            f"Ficheiro '{nome_arquivo}' não encontrado dentro de {DATA_DIR}. "
-            "Verifique se copiou as 6 bases da camada Gold para data/gold/."
+            f"'{nome}' não encontrado em {DATA_DIR}. Copie as 6 tabelas da camada Gold para data/gold/."
         )
-    return matches[0]
+    return achados[0]
 
 
-def consulta_api_sidra(url: str, nomes_colunas: str) -> pd.DataFrame:
-    """Consulta a API SIDRA do IBGE e devolve um DataFrame por id_municipio."""
-    try:
-        response = requests.get(url, timeout=45)
-        response.raise_for_status()
-        data = response.json()
-        df = pd.DataFrame(data[1:])
-        df = df[["D1C", "V"]].rename(columns={"D1C": "id_municipio", "V": nomes_colunas})
-        df["id_municipio"] = df["id_municipio"].astype(str).str.strip()
-        df[nomes_colunas] = pd.to_numeric(df[nomes_colunas], errors="coerce")
-        return df
-    except Exception as exc:
-        print(f"[AVISO] Não foi possível obter {nomes_colunas} via API IBGE: {exc}")
-        return pd.DataFrame(columns=["id_municipio", nomes_colunas])
-
-
-def dados_ibge() -> pd.DataFrame:
-    """
-    Obtém PIB per capita (Tabela 5938 / Var 37) e População (Tabela 6579 / Var 9324)
-    dos municípios brasileiros via API do IBGE, guardando cache em data/external/.
-    """
-    EXTERNAL_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path = EXTERNAL_DIR / "ibge_socioeconomico_municipios.csv"
-
-    if cache_path.exists():
-        print(f"[INFO] A carregar dados socioeconómicos do cache: {cache_path}")
-        return pd.read_csv(cache_path, dtype={"id_municipio": str})
-
-    print("[INFO] A consultar a API oficial do IBGE (SIDRA) para enriquecimento socioeconómico...")
-    url_pib = "https://apisidra.ibge.gov.br/values/t/5938/n6/all/v/37/p/last%201?formato=json"
-    df_pib = consulta_api_sidra(url_pib, "pib_per_capita_brl")
-
-    url_pop = "https://apisidra.ibge.gov.br/values/t/6579/n6/all/v/9324/p/last%201?formato=json"
-    df_pop = consulta_api_sidra(url_pop, "populacao_estimada")
-
-    if not df_pib.empty and not df_pop.empty:
-        df_ibge = pd.merge(df_pib, df_pop, on="id_municipio", how="outer")
-        df_ibge.to_csv(cache_path, index=False)
-        print(f"[OK] Dados do IBGE guardados em {cache_path} ({len(df_ibge)} municípios).")
-        return df_ibge
-
-    return pd.DataFrame(columns=["id_municipio", "pib_per_capita_brl", "populacao_estimada"])
-
-
-def macro_regiao(codigo_uf: str) -> str:
-    """Mapeia o primeiro dígito do código IBGE para a Macrorregião do Brasil."""
-    prefix = str(codigo_uf).strip()
-    mapping = {
-        "1": "Norte",
-        "2": "Nordeste",
-        "3": "Sudeste",
-        "4": "Sul",
-        "5": "Centro-Oeste",
+def le_gold() -> dict:
+    ids = {"id_municipio": str, "codigo_uf_ibge": str}
+    return {
+        "res": pd.read_csv(localiza_csv("fct_resultado_alfabetizacao.csv")),
+        "cob": pd.read_csv(localiza_csv("fct_cobertura_avaliacao.csv")),
+        "meta": pd.read_csv(localiza_csv("ftc_meta_alfabetizacao.csv")),
+        "geo": pd.read_csv(localiza_csv("dim_geografia.csv"), dtype=ids),
+        "rede": pd.read_csv(localiza_csv("dim_rede.csv")),
+        "serie": pd.read_csv(localiza_csv("dim_serie.csv")),
     }
-    return mapping.get(prefix[0], "Desconhecida") if prefix else "Desconhecida"
 
 
-def build_analytical_dataset() -> pd.DataFrame:
-    """Constrói a tabela final para o eda e modelagem."""
-    print("[1/5] A localizar e carregar as 6 tabelas da camada Gold (3 Fatos + 3 Dimensões)...")
-    # 3 Tabelas Fato
-    df_res = pd.read_csv(localiza_csv("fct_resultado_alfabetizacao.csv"))
-    df_cob = pd.read_csv(localiza_csv("fct_cobertura_avaliacao.csv"))
-    df_meta = pd.read_csv(localiza_csv("ftc_meta_alfabetizacao.csv"))
+def confere_dimensoes(rede: pd.DataFrame, serie: pd.DataFrame) -> None:
+    """A base só faz sentido se o rótulo da rede está confirmado e há uma única série."""
+    linha = rede.set_index("rede_key").loc[REDE_ALVO]
+    if not linha["rotulo_confirmado"]:
+        raise ValueError(f"O rótulo da rede {REDE_ALVO} não está confirmado em dim_rede.")
+    if len(serie) != 1:
+        raise ValueError(f"Esperava uma série em dim_serie, encontrei {len(serie)}.")
 
-    # 3 Tabelas Dimensão
-    df_geo = pd.read_csv(
-        localiza_csv("dim_geografia.csv"),
-        dtype={"id_municipio": str, "codigo_uf_ibge": str},
-    )
-    df_rede = pd.read_csv(localiza_csv("dim_rede.csv"))
-    df_serie = pd.read_csv(localiza_csv("dim_serie.csv"))
 
-    # Preparar dim_geografia (nível MUNICIPAL)
-    df_geo_mun = df_geo[df_geo["nivel_geografico"] == "MUNICIPIO"].copy()
-    df_geo_mun["id_municipio"] = (
-        df_geo_mun["id_municipio"].astype(str).str.replace(".0", "", regex=False)
-    )
-    df_geo_mun["macrorregiao"] = df_geo_mun["id_municipio"].apply(macro_regiao)
+def consulta_sidra(url: str, coluna_valor: str, coluna_ano: str) -> pd.DataFrame:
+    resposta = requests.get(url, timeout=60)
+    resposta.raise_for_status()
+    dados = resposta.json()
+    cabecalho, linhas = dados[0], pd.DataFrame(dados[1:])
+    chave_ano = next((k for k, v in cabecalho.items() if v == "Ano (Código)"), None)
 
-    print("[2/5] A unificar tabelas fato (Resultados + Cobertura) por ano, geografia, série e rede...")
-    keys = ["ano", "geo_key", "serie_key", "rede_key"]
-    cols_cob = keys + [
-        "quantidade_registros",
-        "quantidade_presentes",
-        "quantidade_cadernos_validos",
-        "soma_peso_aluno",
-        "taxa_presenca_pct",
-        "taxa_cadernos_validos_pct",
-        "media_proficiencia_ponderada",
-    ]
-    df_full = pd.merge(
-        df_res,
-        df_cob[[c for c in cols_cob if c in df_cob.columns]],
-        on=keys,
-        how="left",
-    )
-
-    # Filtrar registos municipais (geo_key começando por 'MUN:')
-    df_full = df_full[df_full["geo_key"].astype(str).str.startswith("MUN:")].copy()
-
-    print("[3/5] A estruturar separação temporal (2023 -> 2024) para evitar Data Leakage...")
-    df_2023 = df_full[df_full["ano"] == 2023].copy()
-    df_2024 = df_full[df_full["ano"] == 2024].copy()
-
-    # Features históricas de 2023 (t-1): permitidas no modelo preditivo
-    rename_2023 = {
-        "taxa_alfabetizacao_pct": "taxa_alfabetizacao_2023_pct",
-        "media_portugues": "media_portugues_2023",
-        "percentual_participacao_pct": "participacao_2023_pct",
-        "quantidade_registros": "qtd_registros_2023",
-        "soma_peso_aluno": "soma_peso_aluno_2023",
-        "media_proficiencia_ponderada": "proficiencia_ponderada_2023",
-        "nivel_0_pct": "nivel_0_2023_pct",
-        "nivel_1_pct": "nivel_1_2023_pct",
-        "nivel_2_pct": "nivel_2_2023_pct",
-        "nivel_3_pct": "nivel_3_2023_pct",
-    }
-    cols_2023_keep = ["geo_key", "serie_key", "rede_key"] + [
-        k for k in rename_2023.keys() if k in df_2023.columns
-    ]
-    df_2023_feat = df_2023[cols_2023_keep].rename(columns=rename_2023)
-
-    # Desfecho de 2024 (t): usado para construir o Target (y) e auditoria na EDA
-    cols_2024_keep = [
-        "geo_key",
-        "serie_key",
-        "rede_key",
-        "taxa_alfabetizacao_pct",
-        "media_portugues",
-        "percentual_participacao_pct",
-    ]
-    df_2024_target = df_2024[[c for c in cols_2024_keep if c in df_2024.columns]].rename(
-        columns={
-            "taxa_alfabetizacao_pct": "taxa_alfabetizacao_2024_pct",
-            "media_portugues": "media_portugues_2024_auditoria",
-            "percentual_participacao_pct": "participacao_2024_auditoria_pct",
+    saida = pd.DataFrame(
+        {
+            "id_municipio": linhas["D1C"].astype(str).str.strip(),
+            coluna_valor: pd.to_numeric(linhas["V"], errors="coerce"),
         }
     )
+    saida[coluna_ano] = pd.to_numeric(linhas[chave_ano], errors="coerce") if chave_ano else np.nan
+    return saida
 
-    df_abt = pd.merge(
-        df_2024_target,
-        df_2023_feat,
-        on=["geo_key", "serie_key", "rede_key"],
-        how="inner",
+
+def carrega_ibge() -> pd.DataFrame:
+    """PIB total (mil R$) e população estimada por município, com cache em data/external."""
+    EXTERNAL_DIR.mkdir(parents=True, exist_ok=True)
+    cache = EXTERNAL_DIR / "ibge_socioeconomico_municipios.csv"
+
+    if cache.exists():
+        ibge = pd.read_csv(cache, dtype={"id_municipio": str})
+        # a primeira versão do cache gravava o PIB total com o nome 'pib_per_capita_brl'
+        return ibge.rename(columns={"pib_per_capita_brl": "pib_total_mil_brl"})
+
+    pib = consulta_sidra(SIDRA_PIB, "pib_total_mil_brl", "ano_pib")
+    pop = consulta_sidra(SIDRA_POP, "populacao_estimada", "ano_populacao")
+    ibge = pib.merge(pop, on="id_municipio", how="outer")
+    ibge.to_csv(cache, index=False)
+    return ibge
+
+
+def monta_abt() -> pd.DataFrame:
+    gold = le_gold()
+    confere_dimensoes(gold["rede"], gold["serie"])
+
+    # --- resultados: features em 2023, target em 2024 --------------------------------
+    res = gold["res"]
+    res = res[
+        (res["rede_key"] == REDE_ALVO)
+        & res["geo_key"].str.startswith("MUN:")
+        & res["ano"].isin([ANO_FEATURES, ANO_TARGET])
+    ]
+    assert not res.duplicated(["ano", "geo_key"]).any(), "chave (ano, geo_key) duplicada em resultados"
+
+    colunas = {
+        "taxa_alfabetizacao_pct": "taxa_alfabetizacao",
+        "media_portugues": "media_portugues",
+        "percentual_participacao_pct": "participacao",
+    }
+    base = res[res["ano"] == ANO_FEATURES][["geo_key", *colunas]].rename(
+        columns={k: f"{v}_{ANO_FEATURES}" + ("_pct" if k.endswith("_pct") else "") for k, v in colunas.items()}
     )
+    alvo = res[res["ano"] == ANO_TARGET][["geo_key", *colunas]].rename(
+        columns={k: f"{v}_{ANO_TARGET}" + ("_pct" if k.endswith("_pct") else "") for k, v in colunas.items()}
+    )
+    abt = alvo.merge(base, on="geo_key", how="inner")
 
-    print("[4/5] A integrar ftc_meta_alfabetizacao e as 3 Dimensões (Geografia, Rede e Série)...")
-    # Pivotar ftc_meta_alfabetizacao (metas de 2024 a 2030 por município)
-    df_meta_mun = df_meta[df_meta["geo_key"].astype(str).str.startswith("MUN:")].copy()
-    df_meta_pivot = (
-        df_meta_mun.pivot_table(
-            index="geo_key",
-            columns="ano_meta",
-            values="valor_meta_pct",
-            aggfunc="first",
-        )
-        .add_prefix("valor_meta_")
-        .add_suffix("_pct")
+    # --- tamanho da rede avaliada (a tabela não cobre SP) ----------------------------
+    cob = gold["cob"]
+    cob = cob[(cob["rede_key"] == REDE_ALVO) & (cob["ano"] == ANO_FEATURES)]
+    cob = cob[["geo_key", "soma_peso_aluno"]].rename(columns={"soma_peso_aluno": "soma_peso_aluno_2023"})
+    abt = abt.merge(cob, on="geo_key", how="left")
+
+    # --- metas: usamos o que já era conhecido em 2023 (ano_referencia = 2023) --------
+    meta = gold["meta"]
+    meta = meta[
+        (meta["ano_referencia"] == ANO_FEATURES)
+        & (meta["rede_key"] == REDE_ALVO)
+        & meta["geo_key"].str.startswith("MUN:")
+    ]
+    meta = (
+        meta.pivot_table(index="geo_key", columns="ano_meta", values="valor_meta_pct", aggfunc="first")
+        .rename(columns=lambda ano: f"valor_meta_{ano}_pct")
         .reset_index()
     )
+    abt = abt.merge(meta, on="geo_key", how="left")
 
-    # Join com Metas
-    df_abt = pd.merge(df_abt, df_meta_pivot, on="geo_key", how="left")
-
-    # Join com Dimensão 1: dim_geografia
-    cols_geo = ["geo_key", "id_municipio", "nome_geografia", "sigla_uf", "macrorregiao"]
-    df_abt = pd.merge(df_abt, df_geo_mun[cols_geo], on="geo_key", how="left")
-
-    # Join com Dimensão 2: dim_rede
-    cols_rede = ["rede_key", "nome_rede", "escopo_rede", "dependencia_administrativa"]
-    df_abt = pd.merge(
-        df_abt,
-        df_rede[[c for c in cols_rede if c in df_rede.columns]],
-        on="rede_key",
+    # --- geografia -------------------------------------------------------------------
+    geo = gold["geo"]
+    geo = geo[geo["nivel_geografico"] == "MUNICIPIO"].copy()
+    geo["macrorregiao"] = geo["codigo_uf_ibge"].str[0].map(MACRORREGIAO).fillna("Desconhecida")
+    abt = abt.merge(
+        geo[["geo_key", "id_municipio", "nome_geografia", "sigla_uf", "macrorregiao"]],
+        on="geo_key",
         how="left",
     )
 
-    # Join com Dimensão 3: dim_serie
-    cols_serie = ["serie_key", "nome_serie", "ano_escolar", "etapa_ensino"]
-    df_abt = pd.merge(
-        df_abt,
-        df_serie[[c for c in cols_serie if c in df_serie.columns]],
-        on="serie_key",
-        how="left",
-    )
+    # --- IBGE ------------------------------------------------------------------------
+    abt = abt.merge(carrega_ibge(), on="id_municipio", how="left")
+    abt["pib_per_capita_brl"] = abt["pib_total_mil_brl"] * 1000 / abt["populacao_estimada"]
+    abt["log_pib_per_capita"] = np.log1p(abt["pib_per_capita_brl"])
+    abt["log_populacao"] = np.log1p(abt["populacao_estimada"])
 
-    print("[5/5] A enriquecer com indicadores socioeconómicos do IBGE...")
-    df_ibge = dados_ibge()
-    if not df_ibge.empty:
-        df_abt = pd.merge(df_abt, df_ibge, on="id_municipio", how="left")
-    else:
-        df_abt["pib_per_capita_brl"] = np.nan
-        df_abt["populacao_estimada"] = np.nan
+    # --- atributos derivados e target ------------------------------------------------
+    abt["esforco_meta_2024_pp"] = abt["valor_meta_2024_pct"] - abt["taxa_alfabetizacao_2023_pct"]
+    abt["acima_da_meta_em_2023"] = (abt["taxa_alfabetizacao_2023_pct"] >= abt["valor_meta_2024_pct"]).astype(int)
 
-    # =========================================================================
-    # ENGENHARIA DE ATRIBUTOS (FEATURE ENGINEERING) E DEFINIÇÃO DO TARGET (y)
-    # =========================================================================
-    if "valor_meta_2024_pct" in df_abt.columns:
-        df_abt["esforco_necessario_meta_2024_pp"] = (
-            df_abt["valor_meta_2024_pct"] - df_abt["taxa_alfabetizacao_2023_pct"]
-        )
-        df_abt["ja_superava_meta_em_2023"] = (
-            df_abt["taxa_alfabetizacao_2023_pct"] >= df_abt["valor_meta_2024_pct"]
-        ).astype(int)
+    antes = len(abt)
+    abt = abt.dropna(subset=["taxa_alfabetizacao_2024_pct", "taxa_alfabetizacao_2023_pct", "valor_meta_2024_pct"])
+    abt["target_atingiu_meta_2024"] = (abt["taxa_alfabetizacao_2024_pct"] >= abt["valor_meta_2024_pct"]).astype(int)
+    print(f"Municípios com resultado em 2023 e 2024: {antes:,}; com meta e taxas completas: {len(abt):,}")
 
-    # Soma de alunos nos níveis mais baixos de proficiência em 2023 (Níveis 0 a 2 = vulnerabilidade)
-    low_lvl_cols = [c for c in ["nivel_0_2023_pct", "nivel_1_2023_pct", "nivel_2_2023_pct"] if c in df_abt.columns]
-    if low_lvl_cols:
-        df_abt["proporcao_baixo_nivel_2023_pct"] = df_abt[low_lvl_cols].sum(axis=1)
+    return abt.sort_values("id_municipio").reset_index(drop=True)
 
-    df_abt["log_pib_per_capita"] = np.log1p(df_abt["pib_per_capita_brl"].clip(lower=0))
-    df_abt["log_populacao"] = np.log1p(df_abt["populacao_estimada"].clip(lower=0))
 
-    # Target Principal: Atingiu a Meta Oficial de 2024 (1 = Sim, 0 = Não)
-    df_abt["target_atingiu_meta_2024"] = np.where(
-        df_abt["taxa_alfabetizacao_2024_pct"] >= df_abt["valor_meta_2024_pct"], 1, 0
-    )
-
-    # Target Secundário: Acima do Limiar Nacional de 2024 (59.9%)
-    df_abt["target_acima_limiar_nacional"] = np.where(
-        df_abt["taxa_alfabetizacao_2024_pct"] >= 59.9, 1, 0
-    )
-
-    df_abt = df_abt.dropna(subset=["taxa_alfabetizacao_2024_pct", "valor_meta_2024_pct"]).copy()
-
+def main() -> None:
+    abt = monta_abt()
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = PROCESSED_DIR / "abt_alfabetizacao_municipios.csv"
-    df_abt.to_csv(output_path, index=False)
+    saida = PROCESSED_DIR / "abt_alfabetizacao_municipios.csv"
+    abt.to_csv(saida, index=False)
 
-    print("\n" + "=" * 70)
-    print(f"[SUCESSO] Base Analítica (ABT) gerada integrando as 6 tabelas Gold: {output_path}")
-    print(f"Total de registos válidos (Município/Rede): {len(df_abt):,}")
-    print(f"Municípios únicos mapeados: {df_abt['id_municipio'].nunique():,}")
-    print(f"Redes presentes: {df_abt['nome_rede'].unique().tolist()}")
-    print(
-        f"Distribuição do Target (target_atingiu_meta_2024):\n"
-        f"{df_abt['target_atingiu_meta_2024'].value_counts(normalize=True).round(4) * 100}"
-    )
-    print("=" * 70)
-
-    return df_abt
+    print(f"ABT salva em {saida} ({abt.shape[0]:,} linhas, {abt.shape[1]} colunas)")
+    print("Proporção do target:", abt["target_atingiu_meta_2024"].value_counts(normalize=True).round(3).to_dict())
+    faltantes = abt[["pib_per_capita_brl", "populacao_estimada", "soma_peso_aluno_2023"]].isna().sum()
+    print("Nulos:", faltantes.to_dict())
 
 
 if __name__ == "__main__":
-    build_analytical_dataset()
+    main()
