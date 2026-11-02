@@ -1,0 +1,6 @@
+modelo,AUC,± AUC,AUC treino,AP,F1,precisão (não cumpre),recall (não cumpre)
+Baseline (classe majoritária),0.5,0.0,0.5,0.571,0.727,0.0,0.0
+Regressão logística,0.68,0.006,0.684,0.721,0.714,0.614,0.487
+Random forest,0.708,0.014,0.892,0.764,0.725,0.634,0.5
+Gradient boosting,0.697,0.014,0.815,0.75,0.724,0.632,0.47
+Random forest (ajustado),0.708,0.014,0.881,0.761,0.725,0.635,0.493
