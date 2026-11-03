@@ -1,16 +1,12 @@
-black
-flake8
-ipython
-isort
+numpy>=1.26
+pandas>=2.2
+scipy>=1.13
+scikit-learn>=1.5
+matplotlib>=3.8
+seaborn>=0.13
+shap>=0.45
+joblib>=1.4
+requests>=2.31
 jupyterlab
-loguru
-matplotlib
 notebook
-numpy
-pandas
-pip
-python-dotenv
-scikit-learn
-tqdm
-typer
--e .
+ipykernel
